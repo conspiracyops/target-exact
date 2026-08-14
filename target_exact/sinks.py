@@ -3,6 +3,8 @@
 
 import ast
 import base64
+import csv
+import os
 from singer_sdk.exceptions import FatalAPIError
 import xmltodict
 import json
@@ -12,6 +14,73 @@ from pendulum import parse
 from target_exact.client import ExactSink
 from target_exact.constants import countries
 
+
+_PERMANENT_ERROR_PATTERNS = [
+    "period is closed",
+    "accounting period",
+    "glaccount",
+    "gl account",
+    "vat",
+    "btw",
+    "dimension",
+    "cost center",
+    "costcenter",
+    "journal does not exist",
+    "yourref already exists",
+    "supplier",
+    "currency is not valid",
+]
+
+_QUARANTINE_COOLDOWN_HOURS = 24
+
+
+def _is_permanent_error(msg: str) -> bool:
+    """True if a FatalAPIError message matches a known unrecoverable-without-a-data-fix case."""
+    lower = msg.lower()
+    return any(p in lower for p in _PERMANENT_ERROR_PATTERNS)
+
+
+def _quarantine_path(snapshot_dir: str) -> str:
+    return os.path.join(snapshot_dir, "exact_quarantine.csv")
+
+
+def _load_quarantine(snapshot_dir: str) -> dict:
+    """Returns {precoro_id: row_dict} from exact_quarantine.csv, or {} if it doesn't exist yet."""
+    path = _quarantine_path(snapshot_dir)
+    if not os.path.exists(path):
+        return {}
+    with open(path, newline="") as f:
+        return {row["precoro_id"]: row for row in csv.DictReader(f)}
+
+
+def _write_quarantine(snapshot_dir: str, precoro_id: str, error_reason: str) -> None:
+    os.makedirs(snapshot_dir, exist_ok=True)
+    fieldnames = ["precoro_id", "error_category", "error_reason", "first_quarantined", "last_failed"]
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    rows = _load_quarantine(snapshot_dir)
+    if precoro_id in rows:
+        rows[precoro_id]["last_failed"] = now
+        rows[precoro_id]["error_reason"] = error_reason
+    else:
+        rows[precoro_id] = {
+            "precoro_id": precoro_id,
+            "error_category": "permanent",
+            "error_reason": error_reason,
+            "first_quarantined": now,
+            "last_failed": now,
+        }
+
+    with open(_quarantine_path(snapshot_dir), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows.values())
+
+
+def _in_cooldown(quarantine_row: dict) -> bool:
+    """True if this record failed permanently less than _QUARANTINE_COOLDOWN_HOURS ago."""
+    last_failed = datetime.datetime.fromisoformat(quarantine_row["last_failed"])
+    return datetime.datetime.now(datetime.timezone.utc) - last_failed < datetime.timedelta(hours=_QUARANTINE_COOLDOWN_HOURS)
 
 
 class BuyOrdersSink(ExactSink):
@@ -425,10 +494,25 @@ class PurchaseInvoicesSink(ExactSink):
         if record:
             if record.get("error"):
                 raise Exception(record["error"])
-            
-            response = self.request_api(
-                "POST", endpoint=self.endpoint, request_data=record
-            )
+
+            precoro_id = str(record.get("externalId") or record.get("YourRef", "unknown"))
+            snapshot_dir = os.path.join(os.environ.get("ROOT_DIR", "."), "snapshots")
+            quarantine_row = _load_quarantine(snapshot_dir).get(precoro_id)
+            if quarantine_row and _in_cooldown(quarantine_row):
+                self.logger.info(f"Skipping quarantined invoice {precoro_id} (cooldown active)")
+                return None, False, state_updates
+
+            try:
+                response = self.request_api(
+                    "POST", endpoint=self.endpoint, request_data=record
+                )
+            except FatalAPIError as exc:
+                msg = str(exc)
+                if _is_permanent_error(msg):
+                    _write_quarantine(snapshot_dir, precoro_id, msg)
+                    self.logger.warning(f"Quarantined invoice {precoro_id}: {msg}")
+                    return None, False, state_updates
+                raise
 
             if response.status_code in [200,201]:
                 state_updates["success"] = True
@@ -448,7 +532,7 @@ class PurchaseInvoicesSink(ExactSink):
                 return id, True, state_updates
 
             return None, False, state_updates
-        
+
 class PurchaseEntriesSink(ExactSink):
 
     name = "PurchaseEntries"
@@ -677,6 +761,14 @@ class PurchaseEntriesSink(ExactSink):
         if record:
             if record.get("error"):
                 raise Exception(record.get("error"))
+
+            precoro_id = str(record.get("externalId") or record.get("YourRef", "unknown"))
+            snapshot_dir = os.path.join(os.environ.get("ROOT_DIR", "."), "snapshots")
+            quarantine_row = _load_quarantine(snapshot_dir).get(precoro_id)
+            if quarantine_row and _in_cooldown(quarantine_row):
+                self.logger.info(f"Skipping quarantined invoice {precoro_id} (cooldown active)")
+                return None, False, state_updates
+
             # check if there is id to update or create the record
             id = record.pop("Id", None)
             if id:
@@ -685,12 +777,17 @@ class PurchaseEntriesSink(ExactSink):
                 action = "updated"
                 record.pop("PurchaseEntryLines", None)
                 state_updates["is_updated"] = True
-            
+
             try:
                 response = self.request_api(
                     method, endpoint=endpoint, request_data=record
                 )
             except Exception as e:
+                is_permanent = isinstance(e, FatalAPIError) and _is_permanent_error(str(e))
+                if is_permanent:
+                    _write_quarantine(snapshot_dir, precoro_id, str(e))
+                    self.logger.warning(f"Quarantined invoice {precoro_id}: {e}")
+
                 # delete attachments if entry is new and posting failed
                 if method == "POST" and record.get("Document"):
                     self.logger.info(f"Error happened while creating PurchaeEntry, deleting attachments associated with it...")
@@ -703,6 +800,9 @@ class PurchaseEntriesSink(ExactSink):
 
                     if response.status_code == 204:
                         self.logger.info(f"Document '{record['Document']}' succesfully deleted.")
+
+                if is_permanent:
+                    return None, False, state_updates
 
                 raise Exception(e)
 
