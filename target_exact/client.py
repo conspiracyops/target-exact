@@ -171,8 +171,7 @@ class ExactSink(HotglueSink):
             self.logger.exception("Upsert record error")
 
             if self.auth_state:
-                self.update_state(self.auth_state)
-                return
+                state_updates.update(self.auth_state)
             state_updates['error'] = str(e)
 
         if success:
